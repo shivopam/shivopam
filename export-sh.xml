@@ -1,0 +1,22 @@
+<Configuration comment="Specify the type of operation for which this file is meant." operation="export" product="connect">
+	<UserInfo roleId="1" userId="127000000001107055536473900001"/>
+	<TargetZipLoc comment="Location of zip file containing exported objects">/shared/migration/export/export-$TIMESTAMP$.zip</TargetZipLoc>
+	<ExportType comment="Specify A to export all activities or specific activities. Specify PR to export projects.">A</ExportType>
+	<ActivityRefId comment="Specify the activityRefId whose activties need to be exported">
+		001</ActivityRefId>
+	<ProjectRefId comment="Specify the projectRefId whose projects need to be exported">
+		001</ProjectRefId>
+	<ModifiedDate comment="Specify the date(YYYY-MM-DD hh:mm:ss) along with comparison operator"/>
+	<Projects comment="List of all Project names that need to be exported" projectRefId="001">
+	</Projects>
+	
+	<Solution export="no" tableId="001"/>
+	<SolutionTables tableId="001"/>
+	<Folders comment="List of all folders to be exported"/>
+	<Files comment="List of all files to be exported"/>
+<Activities activityRefId="001" comment="List of all activity types that need to be exported">
+	<activity type="Data Mapping">
+<name>Salesforce_to_CSV_Mapping</name>
+</activity>
+</Activities>
+</Configuration>
