@@ -1,0 +1,355 @@
+import jenkins.model.Jenkins
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.io.File;
+ 
+ 
+/*
+    This pipeline used to deploys migration promotion through operations like export from one build environment to another.
+ 
+    Pipeline is made up of following steps
+    1. Init Perameters
+    2. Pull export XML file from GitHub
+    3. Upload XML to k8 shared PVC
+    4. Download Helm chart & deploy migration (export)
+    5. Download solution zip from k8 shared PVC
+    6. Push soution zip to GitHub
+    7. Clean up workspace
+ 
+    Pre-requisite
+    a) Tools/Plugins needs to install:
+        1. Helm
+        2. kubectl client
+        3. Jenkins
+        4. Java 1.8+
+    b) OS Linux
+    c) Jenkins plugins
+        1. Kubernetes
+        2. Git (git plugin 4.8.3, Git client plugin 3.9.0)
+        3. Mask Password
+        4. Credentials Binding Plugin (1.27)
+        5. Parameter Separator
+        6. BlueOcean (Optional)
+         
+    Usage:
+        Steps to create pipeline using jenkinsfile.
+        1. Login into the Jenkins GUI with admin privileges.
+        2. create a pipeline by choosing New Item > Pipeline.
+        3. Copy/past containt of jenkinsfile to Pipeline Definition area.
+        4. Uncheck checkbox "Use Groovy Sandbox".
+        5. Save the pipeline.
+        6. Trigger the pipeline once to initilaize parameters.
+     
+*/
+ 
+/*
+    Upload file to Kubernetes PVC
+ */
+def uploadToSharedPVC (NAMESPACE, CLUSTER_CONTEXT, K8_CREDENTIALS_ID, SERVER_URL, SRC_FILE_PATH, TRG_FILE_PATH) {
+    echo "Upload files to K8 shared PVC"
+        withKubeConfig([credentialsId: K8_CREDENTIALS_ID, serverUrl: SERVER_URL]) {
+                    try {
+                          sh '''#!/bin/bash
+                            kubectl config use-context '''+CLUSTER_CONTEXT+'''
+                            TRG_FILE_PATH='''+TRG_FILE_PATH+'''
+                            if [[ ${TRG_FILE_PATH::1} == "/" ]]
+                                then
+                                  TRG_FILE_PATH=${TRG_FILE_PATH:1};
+                                else
+                                  echo "Forward shash(/) already removed "; fi
+                            podname=$(kubectl -n '''+NAMESPACE+''' get pods | grep -m 1 autoscaler | awk '{print $1}')
+                            kubectl -n '''+NAMESPACE+''' cp '''+SRC_FILE_PATH+''' ${podname}:${TRG_FILE_PATH}
+                            jobname=$(kubectl -n '''+NAMESPACE+''' get jobs | grep -m 1 migration | awk '{print $1}')
+                            if [[ -n "$jobname" ]]; then
+                                kubectl -n '''+NAMESPACE+''' delete job ${jobname}
+                                else
+                                    echo "Migration resource does not exist"
+                            fi
+                                            '''            
+                           
+                        } catch (err) {
+                                echo "Caught: ${err}. Error in uploading file."
+                                error("Caught: ${err}")
+                                currentBuild.result = 'FAILURE'
+                            }
+                        }
+}
+ 
+/*
+    Download file from Kubernetes PVC
+ */
+def downloadFromSharedPVC (NAMESPACE, CLUSTER_CONTEXT, K8_CREDENTIALS_ID, SERVER_URL, SRC_FILE_PATH, TRG_FILE_PATH) {
+    echo "Download files from K8 shared PVC"
+        withKubeConfig([credentialsId: K8_CREDENTIALS_ID, serverUrl: SERVER_URL]) {
+                    try {
+                        sh '''#!/bin/bash
+                            SRC_FILE_PATH='''+SRC_FILE_PATH+'''
+                            if [[ ${SRC_FILE_PATH::1} == "/" ]]
+                                then
+                                  SRC_FILE_PATH=${SRC_FILE_PATH:1};
+                                else
+                                  echo "Forward shash(/) already removed "; fi
+                            kubectl config use-context '''+CLUSTER_CONTEXT+'''
+                            podname=$(kubectl -n '''+NAMESPACE+''' get pods | grep -m 1 autoscaler | awk '{print $1}')
+                            kubectl -n '''+NAMESPACE+''' cp ${podname}:${SRC_FILE_PATH} '''+TRG_FILE_PATH+'''
+                                '''                                        
+                        } catch (err) {
+                                echo "Caught: ${err}. Error in downloading file from K8 PVC."
+                                error("Caught: ${err}")
+                                currentBuild.result = 'FAILURE'
+                            }
+                        }
+}
+ 
+/*
+    Pull Helm Chart
+ */
+def pullHelmChart (HELM_REPO_URL, CHART_NAME) {
+    echo "Pull Helm Chart ("+CHART_NAME+") from Artifact Hub"
+                    try {
+                        sh '''#!/bin/bash
+                            helm repo add adeptia-connect-migration '''+HELM_REPO_URL+'''
+                            helm pull adeptia-connect-migration/'''+CHART_NAME+''' --untar                 
+                            '''
+                        } catch (err) {
+                                echo "Caught: ${err}. Error in pulling Helm chart from repo."
+                                error("Caught: ${err}")
+                                currentBuild.result = 'FAILURE'
+                            }
+         
+}
+ 
+/*
+    Deploy Helm to Kubernetes cluster
+ */
+def deployToCluster (NAMESPACE, CLUSTER_CONTEXT, K8_CREDENTIALS_ID, DATABASE_CREDENTIALS_ID, SERVER_URL, EXPORT_ZIP_PATH, MIGRATION_XML_FILE_PATH) {
+    echo "Deploy Helm chart to Kubernetes cluster"
+                    try {
+                        def BACKEND_DB_USERNAME = getUserName(DATABASE_CREDENTIALS_ID);
+                        def BACKEND_DB_PASSWORD = getPassword(DATABASE_CREDENTIALS_ID);
+                        withKubeConfig([credentialsId: K8_CREDENTIALS_ID, serverUrl: SERVER_URL]) {
+                        //hide password field
+                        wrap([$class: 'MaskPasswordsBuildWrapper', varPasswordPairs: [[password:BACKEND_DB_PASSWORD], [password:BACKEND_DB_USERNAME]]]) {
+                          sh '''#!/bin/bash
+                            kubectl config use-context '''+CLUSTER_CONTEXT+'''
+                            helm upgrade -i migration migration -f migration/values.yaml --set environmentVariables.BACKEND_DB_URL=${BACKEND_DB_URL} --set environmentVariables.BACKEND_DB_USERNAME='''+BACKEND_DB_USERNAME+''' --set environmentVariables.BACKEND_DB_PASSWORD='''+BACKEND_DB_PASSWORD+''' --set environmentVariables.BACKEND_DB_DRIVER_CLASS=${BACKEND_DB_DRIVER_CLASS} --set environmentVariables.BACKEND_DB_TYPE=${BACKEND_DB_TYPE} --set environmentVariables.EXPORT_ZIP_PATH='''+EXPORT_ZIP_PATH+''' --set environmentVariables.MIGRATION_XML_FILE_PATH='''+MIGRATION_XML_FILE_PATH+''' --set environmentVariables.LOG_IDENTIFIER=${LOG_IDENTIFIER} --set environmentVariables.OPERATION=${OPERATION} -n '''+NAMESPACE+'''
+                                            '''
+                            }
+                        }
+                        } catch (err) {
+                                echo "Caught: ${err}. Error in deploying Helm chart."
+                                error("Caught: ${err}")
+                                currentBuild.result = 'FAILURE'
+                            }
+}
+ 
+/*
+    Wait until deployment finish on Kubernetes cluster
+ */
+def waitUntilDepoymentComplete(NAMESPACE, CLUSTER_CONTEXT, K8_CREDENTIALS_ID, SERVER_URL, POD, time_out) {
+    echo "Fetching pod status"
+                    try {
+                        int inter = 5, count = 1;                  
+                        withKubeConfig([credentialsId: K8_CREDENTIALS_ID, serverUrl: SERVER_URL]) {
+                        sh('kubectl config use-context ${CLUSTER_CONTEXT};')
+                        while (true) {
+                                def status = sh script: "kubectl -n ${NAMESPACE} get pods | grep -m 1 ${POD} | awk '{print \$3}' ", returnStdout: true
+                                if (status.toString().trim().contains("Completed")) {
+                                    break;
+                                    }
+                                else if (status.toString().trim().contains("Error")) {
+                                    error("Caught: Migration deployment failed due to error. Please check migration logs.")
+                                    currentBuild.result = 'FAILURE'
+                                    break;
+                                    }
+                               sleep(inter)
+                               echo count+" retry in "+inter*count+" seconds."
+                               count++
+                               if ((count)>=((time_out-10)/inter)) {
+                                    error("Caught: Migration deployment taking more then ideal time. Please check migration logs.")
+                                    currentBuild.result = 'FAILURE'
+                                    break;
+                               }
+                            }
+                        }  
+                        } catch (err) {
+                                echo "Caught: ${err}. Error in fetching pod status. Migration deployment taking more then ideal time. Please check migration logs."
+                                error("Caught: ${err}")
+                                currentBuild.result = 'FAILURE'
+                            }
+}
+ 
+/*
+    Push soution Zip to GitHub repository
+ */
+def pushToGitHub (GIT_BRANCH, GIT_CREDENTIALS_ID, GIT_REPO_URL, FILE_PATH) {
+    echo "Pushing file ("+FILE_PATH+") to GitHub repo"
+                withCredentials([gitUsernamePassword(credentialsId: GIT_CREDENTIALS_ID, gitToolName: 'git-tool')]) {
+                    try {
+                        def gitUser = getUserName(GIT_CREDENTIALS_ID);
+                            sh('sleep 10')
+                            sh('git config --global user.name "'+gitUser+'"')
+                            sh('git config --global user.email "you@example.com"')
+                            sh('git add '+FILE_PATH)
+                            sh('git commit -m "auto commit message" ')
+                            sh('git push ${GIT_REPO_URL} HEAD:'+GIT_BRANCH)
+                        } catch (err) {
+                                echo "Caught: ${err}. Error in pushing file to Github."
+                                error("Caught: ${err}")
+                                currentBuild.result = 'FAILURE'
+                            }
+                    }
+}
+ 
+/*
+    Generate rollback soution Zip file path
+ */
+def convertRollbackZipPath(FILE_PATH) {
+                    def rollbackZipPath = null
+                    def Append = "Rollback_"
+                    try {
+                        Path path = Paths.get(FILE_PATH);
+                        def fileName=path.getFileName().toString()
+                        def parentDir=path.getParent().toString()
+                        rollbackZipPath=parentDir + File.separator + Append + fileName
+                        if(isUnix()){
+                        rollbackZipPath=rollbackZipPath.replace("\\", "/")
+                        }
+                        } catch (err) {
+                                echo "Caught: ${err}. Error in generating rollback soution Zip file path."
+                                error("Caught: ${err}")
+                                currentBuild.result = 'FAILURE'
+                            }
+                    return rollbackZipPath
+}
+ 
+/*
+    Get username from credentials id
+ */
+def getUserName(id) {
+    def userName = null
+    withCredentials([usernamePassword(credentialsId: id, passwordVariable: 'PASSWORD', usernameVariable: 'USERNAME')]) {
+                    try {
+                        userName = USERNAME
+                        } catch (err) {
+                                echo "Caught: ${err}. Error in extracting username from "+id+" ."
+                                error("Caught: ${err}")
+                                currentBuild.result = 'FAILURE'
+                            }
+    }
+    return userName
+}
+ 
+/*
+    Get password from credentials id
+ */
+def getPassword(id) {
+    def password = null
+    withCredentials([usernamePassword(credentialsId: id, passwordVariable: 'PASSWORD', usernameVariable: 'USERNAME')]) {
+                    try {
+                        password = PASSWORD;
+                        } catch (err) {
+                                echo "Caught: ${err}. Error in extracting password from "+id+" ."
+                                error("Caught: ${err}")
+                                currentBuild.result = 'FAILURE'
+                            }
+    }
+    return password
+}                
+                     
+pipeline {
+     
+    // Global default variables
+    environment {
+        //manage deployment status timeout
+        time_out = 300
+    }
+    parameters{
+        //separator(name: 'separator-ce1a9ef5-cd10-4002-a43f-8ae24d9d0bb3', sectionHeader: '''Helm Chart Parameters''', sectionHeaderStyle: 'background-color:#eeeee4;font-size:15px;font-weight:normal;text-transform:uppercase;border-color:gray;', separatorStyle: '''font-weight:bold;line-height:1.5em;font-size:1.5em;''')
+        string(defaultValue: '', description: 'ArtifactHub Helm chart URL e.g. https://adeptia.github.io/adeptia-connect-migration/charts', name: 'HELM_REPO_URL', trim: true)
+        string(defaultValue: '', description: 'Name of Helm chart to be downloaded from ArtifactHub repository e.g. migration', name: 'CHART_NAME', trim: true)
+         
+        //separator(name: 'separator-ce1a9ef5-cd10-4002-a43f-8ae24d9d0bb3', sectionHeader: '''GitHub Parameters''', sectionHeaderStyle: 'background-color:#eeeee4;font-size:15px;font-weight:normal;text-transform:uppercase;border-color:gray;', separatorStyle: '''font-weight:bold;line-height:1.5em;font-size:1.5em;''')
+        string(defaultValue: '', description: 'GitHub credentials ID configured in Jenkins e.g. gitCredential_id', name: 'GIT_CREDENTIALS_ID', trim: true)
+        string(defaultValue: '', description: 'GitHub server URL e.g https://github.com/adeptia/migration-defination.git', name: 'GIT_REPO_URL', trim: true)
+        string(defaultValue: '', description: 'GitHub Branch name e.g. main', name: 'GIT_BRANCH', trim: true)
+        string(defaultValue: '', description: 'Path to upload zip file to GitHub. e.g. test/SA_PF.zip', name: 'GIT_EXPORT_ZIP_PATH', trim: true)
+        string(defaultValue: '', description: 'export xml file path to download from GitHub. e.g. test/export.xml', name: 'GIT_EXPORT_XML_PATH', trim: true)
+ 
+        //separator(name: 'separator-ce1a9ef5-cd10-4002-a43f-8ae24d9d0bb3', sectionHeader: '''Migration Parameters''', sectionHeaderStyle: 'background-color:#eeeee4;font-size:15px;font-weight:normal;text-transform:uppercase;border-color:gray;', separatorStyle: '''font-weight:bold;line-height:1.5em;font-size:1.5em;''')
+        string(defaultValue: '', description: 'Location of export xml file. eg. export', name: 'OPERATION', trim: true)
+        string(defaultValue: '', description: 'Migration export zip path. e.g. /shared/SA_PF.zip', name: 'EXPORT_ZIP_PATH', trim: true)
+        string(defaultValue: '', description: 'Migration export xml file path. e.g. /shared/export.xml', name: 'MIGRATION_XML_FILE_PATH', trim: true)
+        string(defaultValue: '', description: 'Migration log identifier to capture logs from MS environment.', name: 'LOG_IDENTIFIER', trim: true)
+         
+        //separator(name: 'separator-ce1a9ef5-cd10-4002-a43f-8ae24d9d0bb3', sectionHeader: '''K8 Cluster Parameters''', sectionHeaderStyle: 'background-color:#eeeee4;font-size:15px;font-weight:normal;text-transform:uppercase;border-color:gray;', separatorStyle: '''font-weight:bold;line-height:1.5em;font-size:1.5em;''')
+        string(defaultValue: '', description: 'Credentials ID configured in Jenkins to access K8 cluster e.g k8credentials', name: 'K8_CREDENTIALS_ID', trim: true)
+        string(defaultValue: '', description: 'URL to access K8 cluster e.g. https://*******-dns-2ce021bb.hcp.eastus.azmk8s.io:443. You can get the server Url from K8 config file.', name: 'SERVER_URL', trim: true)
+        string(defaultValue: '', description: 'Cluster context to access K8 cluster e.g. adeptia-context', name: 'CLUSTER_CONTEXT', trim: true)
+        string(defaultValue: '', description: 'K8 cluster name space deployment where Connect microservices deployed e.g. adeptia', name: 'NAMESPACE', trim: true)
+        string(defaultValue: '', description: 'URL of database backend bind with application.', name: 'BACKEND_DB_URL', trim: true)
+        string(defaultValue: '', description: 'Credentials ID configured in Jenkins to access database.', name: 'DATABASE_CREDENTIALS_ID', trim: true)
+        string(defaultValue: '', description: 'Driver class of database e.g com.microsoft.sqlserver.jdbc.SQLServerDriver', name: 'BACKEND_DB_DRIVER_CLASS', trim: true)
+        string(defaultValue: '', description: 'Database type e.g SQL-Server.', name: 'BACKEND_DB_TYPE', trim: true)
+         
+        }
+     
+    /*
+        agent {
+            label 'LinuxAgent' 
+    }
+    */
+    agent any
+ 
+stages {
+        stage('Pull XML from GitHub)') {
+            steps {
+                echo 'Checkout from GitHub'
+                    checkout([$class: 'GitSCM', branches: [[name: '*/'+GIT_BRANCH]], extensions: [], userRemoteConfigs: [[credentialsId: GIT_CREDENTIALS_ID, url: GIT_REPO_URL]]])                  
+            }
+        }
+        stage('Upload files to PVC') {
+            steps {
+                echo 'Uploading export xml file'
+                    uploadToSharedPVC (NAMESPACE, CLUSTER_CONTEXT, K8_CREDENTIALS_ID, SERVER_URL, GIT_EXPORT_XML_PATH, MIGRATION_XML_FILE_PATH)
+            }
+        }
+        stage('Pull Helm chart & Deploy Migration') {
+            steps {
+                echo 'Pulling Helm Chart'
+                    pullHelmChart (HELM_REPO_URL, CHART_NAME)
+                 
+                echo 'Deploying Helm Chart'
+                    deployToCluster (NAMESPACE, CLUSTER_CONTEXT, K8_CREDENTIALS_ID, DATABASE_CREDENTIALS_ID, SERVER_URL, EXPORT_ZIP_PATH, MIGRATION_XML_FILE_PATH)
+                    timeout(time: env.time_out, unit: "SECONDS"){
+                    waitUntilDepoymentComplete(NAMESPACE, CLUSTER_CONTEXT, K8_CREDENTIALS_ID, SERVER_URL, 'migration-', env.time_out.toInteger())
+                    }
+            }
+        }
+        stage('Download Zip from PVC') {
+            steps {
+                downloadFromSharedPVC (NAMESPACE, CLUSTER_CONTEXT, K8_CREDENTIALS_ID, SERVER_URL, EXPORT_ZIP_PATH, GIT_EXPORT_ZIP_PATH)
+            }
+        }
+        stage('Push Zip to GitHub') {
+            steps {                    
+                pushToGitHub (GIT_BRANCH, GIT_CREDENTIALS_ID, GIT_REPO_URL, GIT_EXPORT_ZIP_PATH)   
+            }
+        }
+    }
+    post('Clean-up') {
+            always {
+                echo 'Cleanup workspace'
+                cleanWs()
+            }
+            success {
+                echo 'Pipeline succeeded!'
+            }
+            unstable {
+                echo 'Pipeline unstable :/'
+            }
+            failure {
+                echo 'Pipeline failed :('
+            }
+        }
+}
